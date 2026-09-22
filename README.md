@@ -20,14 +20,22 @@ Expected, on `miniflare@4.20260730.0`:
 ```
 node:events:496
       throw er; // Unhandled 'error' event
-Error: This socket has been ended by the other party
-    at Socket.writeAfterFIN [as write] (node:net:793:14)
-    at Socket.ondata (node:internal/streams/readable:1020:24)
-  code: 'EPIPE'
+      ^
+
+Error: write EPIPE
+    at WriteWrap.onWriteComplete [as oncomplete] (node:internal/stream_base_commons:87:19)
+Emitted 'error' event on Socket instance at:
+    at Socket.onerror (node:internal/streams/readable:1028:14)
+    at Socket.emit (node:events:518:28)
+  errno: -32,
+  code: 'EPIPE',
+  syscall: 'write'
 ```
 
-Whether the write lands just before or just after the peer's FIN decides which of the
-two EPIPE forms you get; `Error: write EPIPE` is the same failure.
+`Socket.onerror` is the listener `pipe()` installs on the destination, re-emitting
+because nothing else is listening. Whether the write lands just before or just after the
+peer's FIN decides the exact form: `Error: This socket has been ended by the other party`
+at `Socket.writeAfterFIN` is the same failure.
 
 The script stands up a TCP server that speaks just enough of the Postgres protocol to
 negotiate TLS, then streams rows. A Worker connects through the Hyperdrive binding and
@@ -36,6 +44,8 @@ Miniflare's internals.
 
 `npm run fix` applies the patch below to the installed `miniflare` and `npm run unfix`
 reverts it, so both sides are checkable in one command.
+
+Every row of the table below was run on Node v22.14.0 on 2026-09-22.
 
 ## Where it comes from
 
@@ -75,7 +85,16 @@ clientSocket.on("error", () => dbSocket.destroy());
 dbSocket.on("error", () => clientSocket.destroy());
 ```
 
-Routing them through the controller's `log` first would be friendlier still: today a
+`npm run fix` applies exactly that and the crash goes away, which is enough to show the
+missing listener is the cause.
+
+A complete fix has to go a little further. The handlers that already exist tear down the
+*other* side of the pipe, and on the TLS paths the socket that ends up piped is not the
+`dbSocket` created at the top of `#handleConnection` but a later `newDbSocket` or
+`tlsSocket`. So the listener belongs at each of the four pipe sites, where the peer
+socket is in scope, rather than once at the entry.
+
+Routing the error through the controller's `log` would be friendlier still: today a
 database that resets a connection gives the user a bare Node stack trace that never
 mentions Hyperdrive.
 
@@ -105,12 +124,6 @@ With `sslmode=disable` there is no longer a proxy to crash. Every other mode —
 every hosted Postgres that insists on TLS: Neon, Supabase, RDS.
 
 Run the disable case yourself with `SSLMODE=disable npm run repro:half-close`.
-
-`repro-dispose.mjs` is a second scenario: Workers that leave a pooled connection open,
-then `dispose()`. It crashes on `4.20260424.0` with
-`Error: This socket has been ended by the other party` — the failure that led here, seen
-in CI on `@cloudflare/vitest-pool-workers`. It no longer crashes on `4.20260730.0`,
-for the `sslmode=disable` reason above.
 
 `5.20260921.0-alpha` carries the same `hyperdrive-proxy.ts`, but its constructor options
 were restructured, so these scripts do not run against it unchanged.

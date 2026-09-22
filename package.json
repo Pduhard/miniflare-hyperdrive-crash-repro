@@ -5,7 +5,6 @@
   "type": "module",
   "description": "The Hyperdrive local proxy pipes two sockets without an error handler, so a socket error takes down the whole Node process.",
   "scripts": {
-    "repro:dispose": "node repro-dispose.mjs",
     "repro:half-close": "node repro-half-close.mjs",
     "fix": "node apply-fix.mjs",
     "unfix": "node apply-fix.mjs --revert"
