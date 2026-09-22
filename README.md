@@ -42,6 +42,10 @@ negotiate TLS, then streams rows. A Worker connects through the Hyperdrive bindi
 half-closes its socket while those rows are still arriving. Nothing reaches into
 Miniflare's internals.
 
+`npm run repro:reset` covers a second window, described below. It talks to the proxy
+port directly and resets the connection while the proxy is still negotiating TLS with
+the database.
+
 `npm run fix` applies the patch below to the installed `miniflare` and `npm run unfix`
 reverts it, so both sides are checkable in one command.
 
@@ -76,6 +80,17 @@ involved; pass `--with-listener` to see one extra listener change the outcome.
 deliberately does not wait for open sockets, and its own comment acknowledges they
 linger.
 
+The pipes are not the only gap. `clientSocket` has no listener from the moment the
+server accepts it until a pipe is set up, and on every TLS path that gap spans a write
+to the database, a read back and a TLS handshake. A client that resets in that window
+crashes the process too, and no pipe-site listener can catch it, because no pipe exists
+yet. `npm run repro:reset` shows it.
+
+Reaching that window takes a reset rather than a clean close: a Worker that half-closes,
+aborts its writer or throws, and a Miniflare disposed of mid-negotiation, all leave the
+proxy intact. A raw client resetting the connection does not, which is what the script
+uses.
+
 ## The fix
 
 Two lines at the top of `#handleConnection`, before any branch:
@@ -85,14 +100,15 @@ clientSocket.on("error", () => dbSocket.destroy());
 dbSocket.on("error", () => clientSocket.destroy());
 ```
 
-`npm run fix` applies exactly that and the crash goes away, which is enough to show the
-missing listener is the cause.
+`npm run fix` applies exactly that, both scripts stop crashing, and that is enough to
+show the missing listener is the cause.
 
-A complete fix has to go a little further. The handlers that already exist tear down the
-*other* side of the pipe, and on the TLS paths the socket that ends up piped is not the
-`dbSocket` created at the top of `#handleConnection` but a later `newDbSocket` or
-`tlsSocket`. So the listener belongs at each of the four pipe sites, where the peer
-socket is in scope, rather than once at the entry.
+A complete fix needs the listener in both places, not one instead of the other. At the
+entry, because the negotiation that follows awaits the database and a TLS handshake and
+nothing else listens on the client socket during that window. And at each of the four
+pipe sites, because a handler there tears down the *other* side of the pipe, and on the
+TLS paths the socket that ends up piped is not the `dbSocket` created at the top of
+`#handleConnection` but a later `newDbSocket` or `tlsSocket`.
 
 Routing the error through the controller's `log` would be friendlier still: today a
 database that resets a connection gives the user a bare Node stack trace that never
@@ -105,6 +121,8 @@ mentions Hyperdrive.
 | `4.20260424.0` | `EPIPE`, crashes | `EPIPE`, crashes |
 | `4.20260730.0` | survives | **`EPIPE`, crashes** |
 | `4.20260730.0` + the fix | survives | survives |
+
+`npm run repro:reset` crashes on both versions, and survives with the fix.
 
 `sslmode=disable` stopped crashing because of a change in `index.ts`, not a fix to the
 proxy:
